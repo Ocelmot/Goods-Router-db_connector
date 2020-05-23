@@ -6,6 +6,8 @@ mod tests {
     }
 }
 
+use std::error::Error;
+
 use mongodb::{Client, options::ClientOptions, options::UpdateOptions};
 
 use bson::doc;
@@ -13,6 +15,7 @@ use bson::doc;
 pub use bson::oid::ObjectId;
 
 pub mod location;
+pub mod bfs;
 pub mod geo_types;
 
 
@@ -33,83 +36,65 @@ impl GRConnection{
         return Ok(GRConnection{db_client:client_result.unwrap()});
     }
 
-
-
-    pub fn get_locations(&self) -> Result<mongodb::Cursor, &'static str>{
+    pub fn get_location(self, id: ObjectId) -> Result<location::Location, Box<dyn Error>>{
         let collection = self.db_client.database("goods_router").collection("locations");
-        // let err_result = collection.find_one(doc!{"_id": id}, None);
-        let err_result = collection.find(None, None);
-        match err_result{
-            Err(_) => {return Err("Could not fetch locations")},
-            Ok(result) =>{Ok(result)}
+        let doc = collection.find_one(doc!{"_id": id}, None)?;
+        let doc = doc.ok_or("No such location")?;
+        let location = bson::from_bson(bson::Bson::Document(doc))?;
+        Ok(location)
+    }
+
+    pub fn save_location(&self, location: &mut location::Location) -> Result<(), Box<dyn Error>>{
+        let collection = self.db_client.database("goods_router").collection("locations");
+        let ser = bson::to_bson(&location)?;
+
+        let doc = ser.as_document().ok_or("Could not convert bson to document")?;
+ 
+        match &location.location_id{
+            Some(id) => {
+                let options = UpdateOptions::builder().upsert(true).build();
+                collection.update_one(doc!{"_id": id}, doc.to_owned(), options)?;
+                return Ok(());
+            },
+            None =>{
+                let res = collection.insert_one(doc.to_owned(), None)?;
+                let id = res.inserted_id.as_object_id().ok_or("")?.to_owned();
+                location.location_id = Some(id);
+                return Ok(());
+            }
         }
     }
 
-
-
-    // pub fn get_location(self, id: ObjectId) -> Result<location::Location, &'static str>{
-    //     let collection = self.db_client.database("goods_router").collection("locations");
-    //     let err_result = collection.find_one(doc!{"_id": id}, None);
-    //     match err_result{
-    //         Err(_) => {return Err("Could not get location with that id")},
-    //         Ok(result) => {
-    //             if let Some(result) = result {
-    //                 let loc_result = bson::from_bson(bson::Bson::Document(result));
-                    
-    //                 match loc_result{
-    //                     Ok(x) => {
-    //                         return Ok(x);
-    //                     },
-    //                     Err(x) => {
-    //                         print!("{}", x);
-    //                         return Err("Could not deserialize document");
-    //                     }
-    //                 }
-    //             }else{
-    //                 return Err("No such document");
-    //             }
-    //         }
-    //     }
-    // }
-
-
-
-
-
-
-    pub fn save_location(&self, location: &location::Location) -> Result<(), &'static str>{
+    pub fn get_locations(&self) -> Result<mongodb::Cursor, Box<dyn Error>>{
         let collection = self.db_client.database("goods_router").collection("locations");
-        let ser = bson::to_bson(&location);
+        let result = collection.find(None, None)?;
+        Ok(result)
+    }
 
+    pub fn get_locations_within(&self, bounds: geo_types::Polygon) -> Result<mongodb::Cursor, Box<dyn Error>>{
+        let bounds = bson::to_bson(&bounds)?;
+        let collection = self.db_client.database("goods_router").collection("locations");
+        let result = collection.find(doc!{"location": {"$geoWithin":{"$geometry": bounds}} }, None)?;
+        Ok(result)
+    }
 
-        match ser {
-            Ok(x) => {
-                let doc = x.as_document();
-                match doc {
-                    Some(doc_some) => {
-                        let err_result = match location.location_id{
-                            Some(id) => {
-                                let options = UpdateOptions::builder();
-                                options.upsert(true);
-                                collection.update_one(doc!{"_id": bson::Bson::ObjectId(id)}, doc_some.to_owned(), options.build())
-                            },
-                            None =>{
-                                collection.insert_one(doc_some.to_owned(), None)
-                            }
-                        };
-                        match err_result{
-                            Err(_) => {return Err("Could not insert test")},
-                            Ok(_) => {return Ok(());}
-                        }
-                    },
-                    None => {
-                        return Err("Could not convert bson to document")
-                    }
-                }
-            },
-            Err(x) => {
-                return Err("Could not serialize location");
-            }
+    pub fn get_mutual_locations(&self, location: &location::Location) -> Result<Vec<location::Location>, Box<dyn Error>>{
+        let domain = bson::to_bson(&location.domain)?;
+        let location = bson::to_bson(&location.location)?;
+        let collection = self.db_client.database("goods_router").collection("locations");
+        let data = collection.find(doc!{
+            "$or":[
+                {"location": {"$geoWithin":{"$geometry": domain}}}, //thier location is in our domain
+                {"domain": {"$geoIntersects": {"$geometry": location}}} // our location is in thier domain
+            ]
+        }, None)?;
+        let mut result = vec!{};
+        for l in data{
+            let l = l.unwrap();
+            let l: location::Location = bson::from_bson(bson::Bson::Document(l)).unwrap();
+            result.push(l);
         }
+
+        Ok(result)
     }
 }
